@@ -88,9 +88,6 @@ export class Island {
   private confusedRecovery: number | null = null;
   /** When the agent approval card now on screen first appeared. */
   private approvalShownAt = 0;
-  /** How the island was before the first card of a run opened it, so it can go
-   *  back there once every request is answered. */
-  private modeBeforeApproval: IslandMode | null = null;
   private prevViewBeforeConfused: IslandViewName = "overview";
   private lastSyncedView: IslandViewName | null = null;
 
@@ -364,7 +361,6 @@ export class Island {
     if (State.pendingApproval) return false;
     const next = State.approvalQueue[0];
     if (!next) return false;
-    if (this.modeBeforeApproval === null) this.modeBeforeApproval = State.mode;
     State.pendingApproval = next;
     this.approvalShownAt = performance.now();
     if (next.taskId) State.setFocus(next.taskId);
@@ -375,20 +371,14 @@ export class Island {
   }
 
   /**
-   * Every request is answered: the island hides, which frees the top of the
-   * screen (a browser's tab strip sits right under it). The one exception is a
-   * panel you had opened yourself, which stays open on the overview. Even the
-   * compact peek is put away: it covers the middle of the tab strip.
+   * Every request is answered: the island hides, always. It sits right over the
+   * top of the screen (a browser's tab strip included), and "go back to how it
+   * was" kept it open whenever a card had arrived while it happened to be open:
+   * during the launch greeting, or right after a previous answer.
    */
   private putAwayAfterApproval() {
-    const before = this.modeBeforeApproval;
-    this.modeBeforeApproval = null;
     State.isPinned = false;
     this.fsm.pinned = false;
-    if (before === "expanded") {
-      this.setView(State.defaultView());
-      return;
-    }
     State.view = State.defaultView();
     this.fsm.forceHidden();
     State.notify();
