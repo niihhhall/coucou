@@ -88,6 +88,9 @@ export class Island {
   private confusedRecovery: number | null = null;
   /** When the agent approval card now on screen first appeared. */
   private approvalShownAt = 0;
+  /** How the island was before the first card of a run opened it, so it can go
+   *  back there once every request is answered. */
+  private modeBeforeApproval: IslandMode | null = null;
   private prevViewBeforeConfused: IslandViewName = "overview";
   private lastSyncedView: IslandViewName | null = null;
 
@@ -158,9 +161,7 @@ export class Island {
         State.setPillBadge(taskId, null);
         // One by one: the next request, if any, takes the card straight away.
         if (this.showNextApproval()) return;
-        State.isPinned = false;
-        this.fsm.pinned = false;
-        this.setView(State.defaultView());
+        this.putAwayAfterApproval();
       },
       toggleSound: () => {
         State.settings.soundEnabled = !State.settings.soundEnabled;
@@ -363,6 +364,7 @@ export class Island {
     if (State.pendingApproval) return false;
     const next = State.approvalQueue[0];
     if (!next) return false;
+    if (this.modeBeforeApproval === null) this.modeBeforeApproval = State.mode;
     State.pendingApproval = next;
     this.approvalShownAt = performance.now();
     if (next.taskId) State.setFocus(next.taskId);
@@ -370,6 +372,27 @@ export class Island {
     this.alert("approval");
     State.notify();
     return true;
+  }
+
+  /**
+   * Every request is answered: the island goes back to how it was before the
+   * first card opened it, which is usually hidden. Leaving the full panel up
+   * would sit on the top of the screen, right over a browser's tab strip.
+   */
+  private putAwayAfterApproval() {
+    const before = this.modeBeforeApproval;
+    this.modeBeforeApproval = null;
+    State.isPinned = false;
+    this.fsm.pinned = false;
+    if (before === "expanded") {
+      // You had the panel open yourself: leave it open, on the overview.
+      this.setView(State.defaultView());
+      return;
+    }
+    State.view = State.defaultView();
+    if (before === "compact") this.fsm.forcePetit();
+    else this.fsm.forceHidden();
+    State.notify();
   }
 
   /** The agent gave up on a request (it cancelled the call): forget it. */
@@ -387,10 +410,7 @@ export class Island {
     }
     State.pendingApproval = null;
     if (this.showNextApproval()) return;
-    State.isPinned = false;
-    this.fsm.pinned = false;
-    if (State.view === "approval") this.setView(State.defaultView());
-    State.notify();
+    this.putAwayAfterApproval();
   }
 
   // ── File drop ───────────────────────────────────────────────────────────────

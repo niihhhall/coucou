@@ -181,8 +181,12 @@ function handleHook(island: Island, payload: HookPayload) {
 
   const focused = State.focusId === agentId;
 
-  /** Alerts force the island open; work events only reveal the compact island. */
+  /** Alerts force the island open; work events only reveal the compact island,
+   *  and an agent's work events not even that: Kiro works all day, and a peek on
+   *  every step sits right on top of whatever you are using, your browser's
+   *  tabs included. Its approval cards still open the full panel, via the queue. */
   const surface = (view: Parameters<Island["alert"]>[0], isAlert: boolean) => {
+    if (isExternalAgent && !isAlert) return;
     if (State.mode === "expanded") {
       if (isAlert) island.setView(view);
     } else if (isAlert) {
@@ -262,7 +266,9 @@ function handleHook(island: Island, payload: HookPayload) {
       State.updateTask(agentId, "finished");
       if (payload.message) State.appendStep(agentId, payload.message.slice(0, 60));
       Sound.play("finish");
-      if (focused) surface("finished", true);
+      // An agent ends a turn many times a session: that gets a badge, never a
+      // panel forced open over your screen. Claude Code keeps its finished card.
+      if (focused && !isExternalAgent) surface("finished", true);
       else State.setPillBadge(agentId, "finished");
       window.setTimeout(() => {
         if (isExternalAgent) {
