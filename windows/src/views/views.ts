@@ -35,6 +35,8 @@ export interface ViewHost {
   focus?(): void;
   /** Called every frame while the view is on screen. */
   tick?(nowMs: number): void;
+  /** True while `tick` still has motion to finish; keeps the frame loop alive. */
+  readonly animating?: boolean;
 }
 
 // ── Shared pieces ─────────────────────────────────────────────────────────────
@@ -170,6 +172,9 @@ function buildOverview(actions: ViewActions): ViewHost {
     tick(nowMs: number) {
       if (mode === "ticker") ticker.tick(nowMs);
     },
+    get animating() {
+      return mode === "ticker" && ticker.animating;
+    },
     sync() {
       const task = State.focusTask;
       if (task?.id !== lastFocus) {
@@ -301,7 +306,9 @@ function buildEmpty(actions: ViewActions): ViewHost {
 
 function buildApproval(actions: ViewActions): ViewHost {
   const who = h("div");
-  const code = h("div", { class: "code" });
+  // The whole command, wrapped, scrolling if it is very long: approving a line
+  // you can only half read is approving blind.
+  const code = h("div", { class: "code full" });
   const row = h("div", { class: "actions" });
   const el = h("div", { class: "view" }, card("amber", stack(116, 16, who, code, row)));
   let rowKey = "";
@@ -309,11 +316,19 @@ function buildApproval(actions: ViewActions): ViewHost {
     el,
     sync() {
       clear(who);
-      who.append(agentWho(State.focusTask, "needs permission"));
+      const current = State.pendingApproval;
+      const waiting = State.approvalQueue.filter((r) => r.requestId !== current?.requestId).length;
+      // The pill that asked, which is not necessarily the one in focus.
+      const asker = (current?.taskId && State.tasks.find((t) => t.id === current.taskId)) || State.focusTask;
+      who.append(agentWho(asker, waiting > 0 ? `needs permission · ${waiting} more waiting` : "needs permission"));
       // The whole point of approving here rather than in the terminal: this line
       // is the command, the file path or the URL being authorised, not just the
       // name of the tool asking.
-      code.textContent = State.pendingApproval?.command || State.pendingApproval?.tool || "…";
+      const text = current?.command || current?.tool || "…";
+      if (code.textContent !== text) {
+        code.textContent = text;
+        code.scrollTop = 0;
+      }
       // Two buttons, built once. Rebuilding them between a mouse-down and a
       // mouse-up would swallow the click, and there is nothing left to vary:
       // "Always" is gone until the remembered-rules list exists to back it.

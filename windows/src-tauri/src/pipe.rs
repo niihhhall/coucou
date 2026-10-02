@@ -152,12 +152,24 @@ pub fn start(app: AppHandle) {
 trait Relay: AsyncRead + AsyncWrite + Unpin {
     /// Ends the conversation once everything has been written.
     fn finish(&mut self) {}
+    /// True once the relay on the other end has hung up. The relay never writes
+    /// after its payload, so any read that completes means it is gone.
+    fn peer_gone(&mut self) -> bool {
+        false
+    }
 }
 
 #[cfg(windows)]
 impl Relay for NamedPipeServer {
     fn finish(&mut self) {
         let _ = self.disconnect();
+    }
+    fn peer_gone(&mut self) -> bool {
+        let mut byte = [0u8; 1];
+        match self.try_read(&mut byte) {
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+        }
     }
 }
 
@@ -203,6 +215,12 @@ async fn handle(app: AppHandle, mut pipe: impl Relay) {
     }
 
     let id = format!("{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+    // Kiro's approval relay asks for a card that waits however long a human
+    // takes. Claude Code's requests never carry the flag and keep their timeout.
+    let no_deadline = payload
+        .get("coucou_no_deadline")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let (tx, mut rx) = mpsc::channel::<Reply>(4);
     {
         let pending = app.state::<Pending>();
@@ -212,7 +230,7 @@ async fn handle(app: AppHandle, mut pipe: impl Relay) {
     log::line(format!("hook PermissionRequest id={id}"));
     let _ = app.emit_to(WINDOW_LABEL, "hook", payload);
 
-    let decision = wait_for_decision(&id, &mut rx).await;
+    let decision = wait_for_decision(&app, &id, &mut rx, no_deadline, &mut pipe).await;
     app.state::<Pending>().0.lock().unwrap().remove(&id);
 
     // No decision: say nothing at all. coucou-hook then writes nothing to stdout
@@ -224,8 +242,20 @@ async fn handle(app: AppHandle, mut pipe: impl Relay) {
     pipe.finish();
 }
 
+/// How often an agent's open request checks that its relay is still there.
+const PEER_CHECK: Duration = Duration::from_millis(500);
+
 /// Two waits: a short one for "the card is up", then the long one for a human.
-async fn wait_for_decision(id: &str, rx: &mut mpsc::Receiver<Reply>) -> Option<String> {
+/// With `no_deadline` (an agent approval) the long wait has no end: it lasts
+/// until a click, or until the relay that asked goes away — the agent cancelled
+/// the call — and then the island is told to drop the card.
+async fn wait_for_decision(
+    app: &AppHandle,
+    id: &str,
+    rx: &mut mpsc::Receiver<Reply>,
+    no_deadline: bool,
+    pipe: &mut impl Relay,
+) -> Option<String> {
     match tokio::time::timeout(ACK_TIMEOUT, rx.recv()).await {
         Ok(Some(Reply::Ack)) => {}
         // A click that beats the ack is still a click.
@@ -241,6 +271,30 @@ async fn wait_for_decision(id: &str, rx: &mut mpsc::Receiver<Reply>) -> Option<S
         Err(_) => {
             log::line(format!("hook id={id} island never acknowledged — terminal takes over"));
             return None;
+        }
+    }
+
+    if no_deadline {
+        loop {
+            match tokio::time::timeout(PEER_CHECK, rx.recv()).await {
+                Ok(Some(Reply::Decision(d))) => {
+                    log::line(format!("hook id={id} answered {d}"));
+                    return Some(d);
+                }
+                Ok(Some(Reply::Decline)) => {
+                    log::line(format!("hook id={id} released without a decision"));
+                    return None;
+                }
+                Ok(Some(Reply::Ack)) => {}
+                Ok(None) => return None,
+                Err(_) => {
+                    if pipe.peer_gone() {
+                        log::line(format!("hook id={id} cancelled by the agent"));
+                        let _ = app.emit_to(WINDOW_LABEL, "approval_cancelled", json!({ "request_id": id }));
+                        return None;
+                    }
+                }
+            }
         }
     }
 

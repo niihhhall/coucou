@@ -32,6 +32,11 @@ const PRE_PROGRESS = USC.T_PROG_START - USC.T_DROP;
 
 const modeOrder = (m: IslandMode) => (m === "hidden" ? 0 : m === "compact" ? 1 : 2);
 
+/** How long a just-shown agent approval card ignores clicks and Y/N keys, so a
+ *  click aimed at the previous card (or at whatever sat under the pointer)
+ *  never answers a request you have not read yet. */
+const APPROVAL_CLICK_GUARD_MS = 600;
+
 export class Island {
   readonly fsm = new IslandStateMachine();
 
@@ -81,6 +86,8 @@ export class Island {
   private botHoverStart = { x: 0, y: 0 };
 
   private confusedRecovery: number | null = null;
+  /** When the agent approval card now on screen first appeared. */
+  private approvalShownAt = 0;
   private prevViewBeforeConfused: IslandViewName = "overview";
   private lastSyncedView: IslandViewName | null = null;
 
@@ -138,13 +145,21 @@ export class Island {
         const req = State.pendingApproval;
         void Bridge.log(`decide ${d} req=${req?.requestId ?? "none"}`);
         if (!req) return;
+        // A card that just popped up under the pointer must not catch a click
+        // that was meant for whatever sat there a moment ago.
+        if (req.taskId && performance.now() - this.approvalShownAt < APPROVAL_CLICK_GUARD_MS) return;
         Sound.play(d === "deny" ? "blip" : "approve");
         void Bridge.approvalDecision(req.requestId, d);
         State.pendingApproval = null;
+        State.approvalQueue = State.approvalQueue.filter((r) => r.requestId !== req.requestId);
+        const taskId = req.taskId ?? "integration_claude";
+        const stillWaiting = State.approvalQueue.some((r) => r.taskId === taskId);
+        State.updateTask(taskId, stillWaiting ? "approval" : "working");
+        State.setPillBadge(taskId, null);
+        // One by one: the next request, if any, takes the card straight away.
+        if (this.showNextApproval()) return;
         State.isPinned = false;
         this.fsm.pinned = false;
-        State.updateTask("integration_claude", "working");
-        State.setPillBadge("integration_claude", null);
         this.setView(State.defaultView());
       },
       toggleSound: () => {
@@ -337,6 +352,45 @@ export class Island {
   /** An alert stopped waiting for an answer: let the island auto-close again. */
   dropPin() {
     this.fsm.pinned = false;
+  }
+
+  /**
+   * Puts the oldest waiting agent request on the card, in the full panel, and
+   * pins it there: it stays until Allow or Deny, however long that takes.
+   * Returns false when nothing is waiting or a card is already up.
+   */
+  showNextApproval(): boolean {
+    if (State.pendingApproval) return false;
+    const next = State.approvalQueue[0];
+    if (!next) return false;
+    State.pendingApproval = next;
+    this.approvalShownAt = performance.now();
+    if (next.taskId) State.setFocus(next.taskId);
+    State.isPinned = true;
+    this.alert("approval");
+    State.notify();
+    return true;
+  }
+
+  /** The agent gave up on a request (it cancelled the call): forget it. */
+  cancelApproval(requestId: string) {
+    const wasShown = State.pendingApproval?.requestId === requestId;
+    const req = State.approvalQueue.find((r) => r.requestId === requestId);
+    State.approvalQueue = State.approvalQueue.filter((r) => r.requestId !== requestId);
+    if (req?.taskId && !State.approvalQueue.some((r) => r.taskId === req.taskId)) {
+      State.updateTask(req.taskId, "working");
+      State.setPillBadge(req.taskId, null);
+    }
+    if (!wasShown) {
+      State.notify();
+      return;
+    }
+    State.pendingApproval = null;
+    if (this.showNextApproval()) return;
+    State.isPinned = false;
+    this.fsm.pinned = false;
+    if (State.view === "approval") this.setView(State.defaultView());
+    State.notify();
   }
 
   // ── File drop ───────────────────────────────────────────────────────────────
@@ -717,7 +771,8 @@ export class Island {
     this.viewsEl.classList.toggle("hidden-by-upload", uploadActive);
 
     tickMiniBots(dt);
-    this.views.get(State.view)?.tick?.(nowMs);
+    const view = this.views.get(State.view);
+    view?.tick?.(nowMs);
     if (UploadSeq.isActive) this.stepSequence();
     this.updateCountdown(nowMs);
 
@@ -733,7 +788,9 @@ export class Island {
       ? settling
       : settling ||
         !this.botCx.settled || !this.botCy.settled || !this.botSize.settled ||
-        greetingActive || this.engine.busy || UploadSeq.isActive;
+        greetingActive || this.engine.busy || UploadSeq.isActive ||
+        // A ticker step frozen mid-scroll leaves two rows half-overlapping.
+        !!view?.animating;
 
     if (busy) {
       requestAnimationFrame(this.frame);

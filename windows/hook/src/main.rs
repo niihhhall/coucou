@@ -48,6 +48,10 @@ fn main() {
     let Some((payload, event)) = read_event() else { std::process::exit(0) };
 
     let waits_for_answer = event == "PermissionRequest";
+    // `--no-deadline` (Kiro's approval hook): the agent that asked waits for a
+    // human however long that takes, so we wait too. Claude Code's hooks never
+    // pass it and keep the budget below.
+    let no_deadline = waits_for_answer && std::env::args().skip(1).any(|a| a == "--no-deadline");
     let budget = if waits_for_answer { DECISION_BUDGET } else { FIRE_AND_FORGET_BUDGET };
 
     // The worker owns every blocking call. If it overruns the budget we simply
@@ -59,7 +63,12 @@ fn main() {
         let _ = tx.send(talk(&payload, waits_for_answer));
     });
 
-    if let Ok(Some(decision)) = rx.recv_timeout(budget) {
+    let answer = if no_deadline {
+        rx.recv().ok().flatten()
+    } else {
+        rx.recv_timeout(budget).ok().flatten()
+    };
+    if let Some(decision) = answer {
         if let Some(json) = decision_json(&decision) {
             let mut out = std::io::stdout();
             let _ = writeln!(out, "{json}");
@@ -110,6 +119,8 @@ fn read_event() -> Option<(String, String)> {
         while let Some(arg) = it.next() {
             if arg == "--agent" {
                 agent = it.next().unwrap_or_default();
+            } else if arg == "--no-deadline" {
+                // Read by main(): it only changes how long a PermissionRequest waits.
             } else if arg_event.is_empty() {
                 arg_event = arg;
             }

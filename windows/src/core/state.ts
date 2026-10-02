@@ -26,6 +26,8 @@ export interface ApprovalInfo {
   sessionId: string;
   tool: string;
   command: string;
+  /** The pill that asked; absent for Claude Code's own request. */
+  taskId?: string;
 }
 
 export interface ChatMessage {
@@ -137,6 +139,9 @@ class AppState {
   searchResult: SearchResult | null = null;
   chatHistory: ChatMessage[] = [];
   pendingApproval: ApprovalInfo | null = null;
+  /** Agent approval requests in arrival order; the head is the one on screen.
+   *  Nothing in here expires: each waits for Allow or Deny. */
+  approvalQueue: ApprovalInfo[] = [];
 
   integrations: Record<string, IntegrationInfo> = {};
 

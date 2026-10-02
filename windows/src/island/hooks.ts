@@ -60,29 +60,43 @@ function lastPathComponent(p: string): string {
   return idx >= 0 ? cleaned.slice(idx + 1) : cleaned;
 }
 
-/** frenchStep() — same labels as the macOS app. */
+/** Step labels, in English. A label the relay already made readable (Run, Read,
+ *  Write…) maps to itself, so agent steps pass through unchanged. */
 const TOOL_LABELS: Record<string, string> = {
-  Bash: "Exécute",
-  Read: "Lit",
-  Write: "Écrit",
-  Edit: "Modifie",
-  Glob: "Cherche",
-  Grep: "Recherche",
-  WebSearch: "Recherche web",
-  WebFetch: "Récupère",
-  TodoWrite: "Tâches",
+  Bash: "Run",
+  Read: "Read",
+  Write: "Write",
+  Edit: "Edit",
+  Glob: "Find",
+  Grep: "Search",
+  WebSearch: "Web search",
+  WebFetch: "Fetch",
+  TodoWrite: "Tasks",
   Task: "Agent",
-  LS: "Liste",
-  MultiEdit: "Modifie",
+  LS: "List",
+  MultiEdit: "Edit",
   NotebookEdit: "Notebook",
-  PowerShell: "Exécute",
+  PowerShell: "Run",
 };
+
+/**
+ * The part of a shell command worth reading in one ticker line: whitespace and
+ * newlines collapsed, and the `cd <project> &&` / `cd <project>;` prefix Claude
+ * puts in front of most commands dropped, since the card already names the
+ * project. The ticker ellipsizes, so this only caps pathological lengths.
+ */
+function commandSummary(cmd: string): string {
+  let s = cmd.replace(/\s+/g, " ").trim();
+  const rest = s.replace(/^(?:cd|Set-Location|pushd)\s+("[^"]*"|'[^']*'|\S+)\s*(?:&&|;)\s*/i, "");
+  if (rest) s = rest;
+  return s.slice(0, 120);
+}
 
 function stepLabel(tool: string, input: Record<string, unknown>): string {
   const label = TOOL_LABELS[tool] ?? tool;
   const str = (k: string) => (typeof input[k] === "string" ? (input[k] as string) : null);
   const cmd = str("command");
-  if (cmd) return `${label} · ${cmd.slice(0, 40)}`;
+  if (cmd) return `${label} · ${commandSummary(cmd)}`;
   const path = str("path");
   if (path) return `${label} · ${lastPathComponent(path)}`;
   const file = str("file_path");
@@ -108,6 +122,7 @@ const APPROVAL_FIELDS = [
   "query", // WebSearch
   "pattern", // Glob, Grep
   "prompt", // Task
+  "detail", // an agent's MCP call: its arguments, as sent by the Kiro relay
 ] as const;
 
 function approvalTarget(tool: string, input: Record<string, unknown>): string {
@@ -138,6 +153,10 @@ function clearSession() {
 
 export function registerHookHandlers(island: Island) {
   void onEvent<HookPayload>("hook", (payload) => handleHook(island, payload));
+  // The agent gave up on a request it was waiting on (it cancelled the call).
+  void onEvent<{ request_id?: string }>("approval_cancelled", (payload) => {
+    if (payload.request_id) island.cancelApproval(payload.request_id);
+  });
 }
 
 function handleHook(island: Island, payload: HookPayload) {
@@ -180,11 +199,12 @@ function handleHook(island: Island, payload: HookPayload) {
       State.upsertExternalAgent(agentId, validAgent!, agentColor(validAgent!));
       // An agent pill is removed after every Stop, so each session arrives as a
       // new pill that would never be the one in the card. A new pill takes the
-      // card once, unless the card already shows another pill that is busy.
+      // card once, unless the card already shows another pill that is busy, or
+      // an approval is waiting for an answer there.
       const shown = State.focusTask;
       const busy =
         !!shown && shown.id !== agentId && (shown.state === "working" || shown.state === "thinking");
-      if (isNew && !busy) State.setFocus(agentId);
+      if (isNew && !busy && !State.pendingApproval) State.setFocus(agentId);
     } else {
       upsert(projectName, cwd);
     }
@@ -280,11 +300,31 @@ function handleHook(island: Island, payload: HookPayload) {
       break;
 
     case "PermissionRequest": {
-      // External agents do not get an approval card — showing one would look like
-      // a Claude Code request. Decline immediately so the agent re-asks in its
-      // terminal. Approval support for other agents will come with Codex support.
+      // A third-party agent (Kiro, through its approval hook): every request is
+      // queued and shown one at a time in the full panel, and none of them
+      // expires. The agent is waiting on the answer anyway, so the card stays
+      // until a human clicks Allow or Deny.
       if (isExternalAgent) {
-        if (payload.request_id) void Bridge.approvalDecline(payload.request_id);
+        const requestId = payload.request_id ?? "";
+        if (!requestId) break;
+        ensurePill();
+        const tool = payload.tool_name ?? "Tool";
+        State.approvalQueue.push({
+          requestId,
+          sessionId: payload.session_id ?? "",
+          tool,
+          command: approvalTarget(tool, payload.tool_input ?? {}),
+          taskId: agentId,
+        });
+        // Queued counts as shown: it will get the card, and nothing times out.
+        void Bridge.approvalAck(requestId);
+        State.updateTask(agentId, "approval");
+        Sound.play("approval");
+        if (!island.showNextApproval()) {
+          // Another request holds the card; this one waits its turn.
+          if (State.pendingApproval?.taskId !== agentId) State.setPillBadge(agentId, "approval");
+          State.notify();
+        }
         break;
       }
 
@@ -325,12 +365,15 @@ function handleHook(island: Island, payload: HookPayload) {
       // taken over and the card would be lying.
       pendingTimeout = window.setTimeout(() => {
         pendingTimeout = null;
-        if (!State.pendingApproval) return;
+        // Only this request expires: a card shown since then (an agent's, which
+        // never expires) is not ours to clear.
+        if (State.pendingApproval?.requestId !== requestId) return;
         State.pendingApproval = null;
-        State.isPinned = false;
-        island.dropPin();
         State.updateTask(CLAUDE_ID, "working");
         State.setPillBadge(CLAUDE_ID, null);
+        if (island.showNextApproval()) return;
+        State.isPinned = false;
+        island.dropPin();
         if (State.view === "approval") island.setView(State.defaultView());
         State.notify();
       }, 110_000);
