@@ -176,7 +176,15 @@ function handleHook(island: Island, payload: HookPayload) {
   /** Ensure the agent pill exists (no-op for Claude Code). */
   const ensurePill = () => {
     if (isExternalAgent) {
+      const isNew = !State.tasks.some((t) => t.id === agentId);
       State.upsertExternalAgent(agentId, validAgent!, agentColor(validAgent!));
+      // An agent pill is removed after every Stop, so each session arrives as a
+      // new pill that would never be the one in the card. A new pill takes the
+      // card once, unless the card already shows another pill that is busy.
+      const shown = State.focusTask;
+      const busy =
+        !!shown && shown.id !== agentId && (shown.state === "working" || shown.state === "thinking");
+      if (isNew && !busy) State.setFocus(agentId);
     } else {
       upsert(projectName, cwd);
     }
@@ -238,7 +246,8 @@ function handleHook(island: Island, payload: HookPayload) {
       else State.setPillBadge(agentId, "finished");
       window.setTimeout(() => {
         if (isExternalAgent) {
-          State.removeTask(agentId);
+          // Work that resumed during these 5 s keeps the pill, and the card.
+          if (State.tasks.find((t) => t.id === agentId)?.state === "finished") State.removeTask(agentId);
         } else {
           State.updateTask(agentId, "idle");
           State.setPillBadge(agentId, null);
