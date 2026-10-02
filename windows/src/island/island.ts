@@ -375,9 +375,10 @@ export class Island {
   }
 
   /**
-   * Every request is answered: the island goes back to how it was before the
-   * first card opened it, which is usually hidden. Leaving the full panel up
-   * would sit on the top of the screen, right over a browser's tab strip.
+   * Every request is answered: the island hides, which frees the top of the
+   * screen (a browser's tab strip sits right under it). The one exception is a
+   * panel you had opened yourself, which stays open on the overview. Even the
+   * compact peek is put away: it covers the middle of the tab strip.
    */
   private putAwayAfterApproval() {
     const before = this.modeBeforeApproval;
@@ -385,13 +386,11 @@ export class Island {
     State.isPinned = false;
     this.fsm.pinned = false;
     if (before === "expanded") {
-      // You had the panel open yourself: leave it open, on the overview.
       this.setView(State.defaultView());
       return;
     }
     State.view = State.defaultView();
-    if (before === "compact") this.fsm.forcePetit();
-    else this.fsm.forceHidden();
+    this.fsm.forceHidden();
     State.notify();
   }
 
